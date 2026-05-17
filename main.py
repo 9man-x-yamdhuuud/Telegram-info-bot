@@ -26,7 +26,7 @@ except ImportError:
 
 # ==================== CONFIGURATION ====================
 API_TOKEN = "8735045882:dGnfJAPg"
-BOT_TOKEN = os.environ.get('BOT_TOKEN', '')
+BOT_TOKEN = os.environ.get('8683516544:AAGyndEbkMW1wsbXTFIbFMg8AVA_uZ__bSk', '')
 PORT = int(os.environ.get('PORT', 8080))  # Render expects port 8080
 LANG = "ru"
 LIMIT = 500

@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
 """
-Leakosint API Telegram Bot - Facebook UID + Instagram Lookup
-------------------------------------------------------------
-Features:
-- Facebook UID lookup (full profile info)
-- Instagram username lookup (public info)
-- Phone/Email/Name search in breaches
-- Paginated results with inline buttons
+COMPLETE OSINT TELEGRAM BOT - WITH PORT BINDING FOR RENDER
+==========================================================
+Port 8080 is bound for health checks
 """
 
 import requests
 import logging
 import re
 import json
+import os
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import phonenumbers
+from phonenumbers import carrier, geocoder, timezone
 from random import randint
 from typing import Dict, List, Optional, Tuple
 
@@ -20,23 +21,17 @@ try:
     import telebot
     from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 except ImportError:
-    print("ERROR: Run: pip install pyTelegramBotAPI requests")
+    print("ERROR: Run: pip install pyTelegramBotAPI requests phonenumbers")
     exit(1)
 
 # ==================== CONFIGURATION ====================
-# API Key already added here
-API_TOKEN = "8735045882:dGnfJAPg"  # Your Leakosint API token
-BOT_TOKEN = "8683516544:AAGyndEbkMW1wsbXTFIbFMg8AVA_uZ__bSk"  # You need to add your Telegram Bot Token from @BotFather
+API_TOKEN = "8735045882:dGnfJAPg"
+BOT_TOKEN = os.environ.get('BOT_TOKEN', '')
+PORT = int(os.environ.get('PORT', 8080))  # Render expects port 8080
 LANG = "ru"
-LIMIT = 300
+LIMIT = 500
 LEAKOSINT_API_URL = "https://leakosintapi.com/"
-
-# Facebook API endpoints (multiple fallbacks)
-FACEBOOK_API_URLS = [
-    "https://graph.facebook.com/v18.0/{uid}?access_token=6628568379%7Cc1e620fa708a1d5696fb991c1bde5662&fields=id,name,first_name,last_name,email,gender,birthday,location,hometown,relationship_status,about,picture.width(500).height(500),cover,devices,education,work,friends.limit(0),likes.limit(0),posts.limit(0),albums.limit(0),videos.limit(0),groups.limit(0),events.limit(0),music.limit(0),books.limit(0),games.limit(0)",
-    "https://findmyfbid.com/api?uid={uid}",
-    "https://lookup-id.com/api/?id={uid}"
-]
+PHONE_DEFAULT_COUNTRY = "IN"
 
 ALLOWED_USER_IDS = []
 report_cache: Dict[str, List[str]] = {}
@@ -51,38 +46,79 @@ logger = logging.getLogger(__name__)
 # Initialize bot
 bot = telebot.TeleBot(BOT_TOKEN)
 
-# ==================== FACEBOOK UID LOOKUP ====================
-def fetch_facebook_info(uid: str) -> Optional[Dict]:
-    """
-    Fetch Facebook profile information using UID.
-    Returns dict with profile data or None if not found.
-    """
-    uid = str(uid).strip()
+# ==================== PORT HEALTH CHECK SERVER ====================
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    """Handle health check requests on port 8080"""
     
-    # Method 1: Try Graph API with public access token
+    def do_GET(self):
+        """Respond to GET requests"""
+        if self.path == '/health' or self.path == '/':
+            self.send_response(200)
+            self.send_header('Content-type', 'text/html')
+            self.end_headers()
+            self.wfile.write(b"""
+            <html>
+            <head><title>OSINT Bot</title></head>
+            <body style="font-family: Arial;">
+                <h1>✅ Bot is Running!</h1>
+                <p>Status: Active</p>
+                <p>Features: Phone Search | Email Search | Facebook UID | Instagram Location</p>
+                <hr>
+                <small>Telegram OSINT Bot v3.0</small>
+            </body>
+            </html>
+            """)
+        else:
+            self.send_response(404)
+            self.end_headers()
+    
+    def log_message(self, format, *args):
+        """Suppress log messages"""
+        pass
+
+def run_health_server():
+    """Run HTTP server for health checks"""
+    try:
+        server = HTTPServer(('0.0.0.0', PORT), HealthCheckHandler)
+        logger.info(f"✅ Health check server running on port {PORT}")
+        server.serve_forever()
+    except Exception as e:
+        logger.error(f"Health server error: {e}")
+
+# ==================== INSTAGRAM FUNCTIONS ====================
+def fetch_instagram_full_info(username: str) -> Optional[Dict]:
+    """Fetch Instagram profile with location."""
+    username = username.strip().lstrip('@').lower()
+    
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
         'Accept': 'application/json'
     }
     
-    # Try multiple API endpoints
-    for api_url in FACEBOOK_API_URLS:
+    urls = [
+        f"https://www.instagram.com/api/v1/users/web_profile_info/?username={username}",
+        f"https://www.instagram.com/{username}/?__a=1&__d=1"
+    ]
+    
+    for url in urls:
         try:
-            url = api_url.format(uid=uid)
             response = requests.get(url, headers=headers, timeout=15)
-            
             if response.status_code == 200:
                 data = response.json()
-                if data and 'error' not in data:
-                    return format_facebook_data(data, uid)
+                if 'graphql' in data:
+                    user_data = data['graphql']['user']
+                    return format_instagram_location(user_data, username)
+                elif 'data' in data and 'user' in data['data']:
+                    user_data = data['data']['user']
+                    return format_instagram_location(user_data, username)
         except:
             continue
     
-    # Method 2: Search in Leakosint database for Facebook data
+    # Search in Leakosint
     try:
         payload = {
             "token": API_TOKEN,
-            "request": f"facebook.com {uid}",
+            "request": f"instagram {username}",
             "limit": 100,
             "lang": LANG
         }
@@ -91,43 +127,185 @@ def fetch_facebook_info(uid: str) -> Optional[Dict]:
             data = response.json()
             if "List" in data:
                 for db_name, db_content in data["List"].items():
-                    if "facebook" in db_name.lower() or "social" in db_name.lower():
-                        entries = db_content.get("Data", [])
-                        for entry in entries:
-                            if uid in str(entry) or str(uid) in str(entry):
-                                return {
-                                    "uid": uid,
-                                    "found_in_breach": True,
-                                    "breach_data": entry,
-                                    "source": f"Database: {db_name}",
-                                    "data_type": "breach"
-                                }
-    except:
-        pass
-    
-    # Method 3: Try to get username from UID and fetch info
-    try:
-        # Convert UID to username via lookup service
-        lookup_url = f"https://api.reiyuura.com/api/fb/?id={uid}"
-        response = requests.get(lookup_url, timeout=10)
-        if response.status_code == 200:
-            data = response.json()
-            if data.get('status') == 'success':
-                return {
-                    "uid": uid,
-                    "username": data.get('username', 'N/A'),
-                    "name": data.get('name', 'N/A'),
-                    "found_in_breach": False,
-                    "source": "Public Lookup API"
-                }
+                    entries = db_content.get("Data", [])
+                    for entry in entries:
+                        if username in str(entry).lower():
+                            location = extract_location_from_text(str(entry))
+                            return {
+                                "username": username,
+                                "found_in_breach": True,
+                                "breach_data": entry,
+                                "location": location,
+                                "source": f"Database: {db_name}"
+                            }
     except:
         pass
     
     return None
 
-def format_facebook_data(data: dict, uid: str) -> dict:
-    """Format Facebook API response into structured data."""
-    formatted = {
+def format_instagram_location(user_data: dict, username: str) -> dict:
+    """Format Instagram data with location."""
+    bio = user_data.get('biography', '')
+    location_data = extract_location_from_text(bio)
+    
+    # Get recent posts with locations
+    recent_locations = []
+    recent_media = user_data.get('edge_owner_to_timeline_media', {}).get('edges', [])
+    for post in recent_media[:5]:
+        node = post.get('node', {})
+        if node.get('location'):
+            loc = node.get('location')
+            recent_locations.append({
+                'name': loc.get('name', ''),
+                'lat': loc.get('lat', ''),
+                'lng': loc.get('lng', '')
+            })
+    
+    return {
+        "username": user_data.get('username', username),
+        "full_name": user_data.get('full_name', 'N/A'),
+        "bio": bio[:300],
+        "followers": user_data.get('edge_followed_by', {}).get('count', 0),
+        "following": user_data.get('edge_follow', {}).get('count', 0),
+        "posts": user_data.get('edge_owner_to_timeline_media', {}).get('count', 0),
+        "is_private": user_data.get('is_private', False),
+        "is_verified": user_data.get('is_verified', False),
+        "external_url": user_data.get('external_url', 'N/A'),
+        "business_category": user_data.get('business_category_name', 'N/A'),
+        "account_type": "Business" if user_data.get('is_business_account') else "Personal",
+        "location": location_data,
+        "recent_locations": recent_locations,
+        "found_in_breach": False
+    }
+
+def extract_location_from_text(text: str) -> Dict:
+    """Extract location info from text."""
+    location = {"city": None, "state": None, "country": None}
+    
+    # City patterns
+    city_match = re.search(r'(?:in|at|from|📍)\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)', text)
+    if city_match:
+        location["city"] = city_match.group(1)
+    
+    # Country detection
+    countries = ['India', 'USA', 'UK', 'Russia', 'Germany', 'France', 'Canada', 'Australia', 'UAE']
+    for country in countries:
+        if country.lower() in text.lower():
+            location["country"] = country
+            break
+    
+    return location
+
+def create_instagram_report(insta_data: dict, username: str) -> str:
+    """Create Instagram report."""
+    if not insta_data:
+        return f"""
+❌ <b>Instagram '@{username}' not found!</b>
+
+💡 Try: /ig cristiano
+"""
+    
+    if insta_data.get('found_in_breach'):
+        return f"""
+🔐 <b>Instagram: @{username}</b>
+⚠️ <b>FOUND IN BREACH!</b>
+
+📍 <b>Location:</b>
+{format_location_text(insta_data.get('location', {}))}
+
+📋 <b>Data:</b>
+<pre>{json.dumps(insta_data.get('breach_data', {}), indent=2, ensure_ascii=False)[:800]}</pre>
+"""
+    
+    status = "🔒 Private" if insta_data['is_private'] else "🌐 Public"
+    verified = " ✓✓✓" if insta_data['is_verified'] else ""
+    
+    report = f"""
+📸 <b>Instagram Profile{verified}</b> ({status})
+
+<b>👤 Username:</b> @{insta_data['username']}
+<b>📛 Name:</b> {insta_data['full_name']}
+<b>📝 Bio:</b> {insta_data['bio']}
+
+━━━━━━━━━━━━━━━━━━━━━━
+<b>📍 LOCATION INFO:</b>
+{format_location_text(insta_data.get('location', {}))}
+
+<b>📊 Stats:</b>
+• Followers: {format_number(insta_data['followers'])}
+• Following: {format_number(insta_data['following'])}
+• Posts: {format_number(insta_data['posts'])}
+
+<b>🔗 Profile:</b> https://instagram.com/{insta_data['username']}
+"""
+    
+    if insta_data.get('recent_locations'):
+        report += f"\n<b>📍 Recent Check-ins:</b>\n"
+        for loc in insta_data['recent_locations'][:3]:
+            if loc.get('name'):
+                report += f"  • {loc['name']}\n"
+                if loc.get('lat') and loc.get('lng'):
+                    report += f"    🗺️ https://maps.google.com/?q={loc['lat']},{loc['lng']}\n"
+    
+    return report
+
+# ==================== FACEBOOK FUNCTIONS ====================
+def fetch_facebook_full_info(uid: str) -> Optional[Dict]:
+    """Fetch Facebook profile with address."""
+    uid = str(uid).strip()
+    
+    headers = {'User-Agent': 'Mozilla/5.0'}
+    
+    fb_urls = [
+        f"https://graph.facebook.com/v18.0/{uid}?access_token=6628568379%7Cc1e620fa708a1d5696fb991c1bde5662&fields=id,name,first_name,last_name,email,gender,birthday,location,hometown,relationship_status,about,picture,education,work",
+        f"https://graph.facebook.com/v18.0/{uid}?fields=id,name,first_name,last_name,email,gender,birthday,location&access_token=6628568379%7Cc1e620fa708a1d5696fb991c1bde5662"
+    ]
+    
+    for url in fb_urls:
+        try:
+            response = requests.get(url, headers=headers, timeout=15)
+            if response.status_code == 200:
+                data = response.json()
+                if data and 'error' not in data:
+                    return format_facebook_address(data, uid)
+        except:
+            continue
+    
+    # Search Leakosint
+    try:
+        payload = {
+            "token": API_TOKEN,
+            "request": f"facebook {uid}",
+            "limit": 100,
+            "lang": LANG
+        }
+        response = requests.post(LEAKOSINT_API_URL, json=payload, timeout=20)
+        if response.status_code == 200:
+            data = response.json()
+            if "List" in data:
+                for db_name, db_content in data["List"].items():
+                    entries = db_content.get("Data", [])
+                    for entry in entries:
+                        if uid in str(entry):
+                            address = extract_address_from_text(str(entry))
+                            return {
+                                "uid": uid,
+                                "found_in_breach": True,
+                                "breach_data": entry,
+                                "address": address,
+                                "source": f"Database: {db_name}"
+                            }
+    except:
+        pass
+    
+    return None
+
+def format_facebook_address(data: dict, uid: str) -> dict:
+    """Format Facebook data with address."""
+    location = data.get('location', {})
+    hometown = data.get('hometown', {})
+    
+    return {
         "uid": uid,
         "name": data.get('name', 'N/A'),
         "first_name": data.get('first_name', 'N/A'),
@@ -136,81 +314,72 @@ def format_facebook_data(data: dict, uid: str) -> dict:
         "gender": data.get('gender', 'N/A'),
         "birthday": data.get('birthday', 'N/A'),
         "relationship": data.get('relationship_status', 'N/A'),
-        "about": data.get('about', 'N/A')[:300],
-        "location": data.get('location', {}).get('name', 'N/A'),
-        "hometown": data.get('hometown', {}).get('name', 'N/A'),
+        "about": data.get('about', 'N/A')[:200],
+        "current_city": location.get('name', 'N/A'),
+        "hometown": hometown.get('name', 'N/A'),
         "profile_url": f"https://facebook.com/{uid}",
-        "profile_pic": data.get('picture', {}).get('data', {}).get('url', 'N/A'),
-        "cover_photo": data.get('cover', {}).get('source', 'N/A'),
         "education": [],
         "work": [],
         "found_in_breach": False
     }
     
-    # Parse education
+    # Add education
     if 'education' in data:
         for edu in data['education'][:3]:
             school = edu.get('school', {}).get('name', 'N/A')
             year = edu.get('year', {}).get('name', '')
             formatted['education'].append(f"{school} ({year})" if year else school)
     
-    # Parse work
-    if 'work' in data:
-        for job in data['work'][:3]:
-            employer = job.get('employer', {}).get('name', 'N/A')
-            position = job.get('position', {}).get('name', '')
-            formatted['work'].append(f"{position} at {employer}" if position else employer)
-    
     return formatted
 
+def extract_address_from_text(text: str) -> Dict:
+    """Extract address from text."""
+    address = {"street": None, "city": None, "zip": None}
+    
+    street_match = re.search(r'\b\d+\s+[A-Za-z\s]+(?:Street|St|Road|Rd|Avenue|Ave)\b', text, re.IGNORECASE)
+    if street_match:
+        address["street"] = street_match.group(0)
+    
+    zip_match = re.search(r'\b\d{5}(?:-\d{4})?\b', text)
+    if zip_match:
+        address["zip"] = zip_match.group(0)
+    
+    return address
+
 def create_facebook_report(fb_data: dict, uid: str) -> str:
-    """Create formatted report from Facebook data."""
+    """Create Facebook report."""
     if not fb_data:
         return f"""
 ❌ <b>Facebook UID {uid} not found!</b>
 
-💡 <b>Possible reasons:</b>
-• Account is private/deleted
-• Invalid UID format
-• Account doesn't exist
-
-📝 <b>Tips:</b>
-• Make sure UID is numeric (e.g., 1000123456789)
-• Try searching with full name instead
-• Account might be restricted in your region
+💡 Usage: /fb 61556123456789
 """
     
-    # If found in breach database
     if fb_data.get('found_in_breach'):
         return f"""
 🔐 <b>Facebook UID: {uid}</b>
-⚠️ <b>⚠️ FOUND IN DATA BREACH! ⚠️</b>
+⚠️ <b>FOUND IN BREACH!</b>
 
-📋 <b>Breached Information:</b>
-<pre>{json.dumps(fb_data.get('breach_data', {}), indent=2, ensure_ascii=False)[:1000]}</pre>
+📍 <b>Address:</b>
+{format_address_text(fb_data.get('address', {}))}
 
-<b>Source:</b> {fb_data.get('source', 'Unknown')}
-<b>Risk Level:</b> HIGH - Change your password immediately!
+📋 <b>Data:</b>
+<pre>{json.dumps(fb_data.get('breach_data', {}), indent=2, ensure_ascii=False)[:800]}</pre>
 """
     
-    # Normal Facebook profile info
     report = f"""
-📘 <b>Facebook Profile Information</b>
+📘 <b>FACEBOOK PROFILE</b>
 ━━━━━━━━━━━━━━━━━━━━━━
 
 <b>🆔 UID:</b> <code>{fb_data['uid']}</code>
 <b>👤 Name:</b> {fb_data['name']}
-<b>📛 First Name:</b> {fb_data['first_name']}
-<b>📛 Last Name:</b> {fb_data['last_name']}
+<b>📧 Email:</b> {fb_data['email']}
+
+<b>📍 Location:</b> {fb_data['current_city']}
+<b>🏠 Hometown:</b> {fb_data['hometown']}
 
 <b>⚧ Gender:</b> {fb_data['gender']}
 <b>🎂 Birthday:</b> {fb_data['birthday']}
-<b>💑 Relationship:</b> {fb_data['relationship']}
-
-<b>📍 Location:</b> {fb_data['location']}
-<b>🏠 Hometown:</b> {fb_data['hometown']}
-
-<b>📧 Email:</b> {fb_data['email']}
 """
     
     if fb_data.get('education'):
@@ -218,174 +387,58 @@ def create_facebook_report(fb_data: dict, uid: str) -> str:
         for edu in fb_data['education']:
             report += f"  • {edu}\n"
     
-    if fb_data.get('work'):
-        report += f"\n<b>💼 Work:</b>\n"
-        for job in fb_data['work']:
-            report += f"  • {job}\n"
-    
-    if fb_data['about'] != 'N/A':
-        report += f"\n<b>📝 About:</b>\n{fb_data['about']}\n"
-    
-    report += f"""
-━━━━━━━━━━━━━━━━━━━━━━
-<b>🔗 Profile Link:</b>
-<a href='{fb_data['profile_url']}'>{fb_data['profile_url']}</a>
-"""
+    report += f"\n<b>🔗 Profile:</b> {fb_data['profile_url']}"
+    report += f"\n\n<b>🗺️ Maps:</b> https://maps.google.com/?q={fb_data['current_city']}"
     
     return report
 
-# ==================== INSTAGRAM LOOKUP ====================
-def fetch_instagram_info(username: str) -> Optional[Dict]:
-    """
-    Fetch public Instagram profile information.
-    """
-    username = username.strip().lstrip('@').lower()
-    
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Accept': 'application/json',
-        'Accept-Language': 'en-US,en;q=0.9'
-    }
-    
-    # Try Instagram Graph API
+# ==================== PHONE FUNCTIONS ====================
+def validate_phone_number(phone: str) -> Optional[Dict]:
+    """Validate phone number."""
     try:
-        url = f"https://www.instagram.com/api/v1/users/web_profile_info/?username={username}"
-        response = requests.get(url, headers=headers, timeout=10)
-        if response.status_code == 200:
-            data = response.json()
-            user_data = data.get('data', {}).get('user', {})
-            if user_data:
-                return format_instagram_data(user_data, username)
+        cleaned = re.sub(r'[^\d+]', '', phone)
+        if cleaned.startswith('+'):
+            parsed = phonenumbers.parse(cleaned, None)
+        else:
+            parsed = phonenumbers.parse(cleaned, PHONE_DEFAULT_COUNTRY)
+        
+        if phonenumbers.is_valid_number(parsed):
+            return {
+                "valid": True,
+                "international": phonenumbers.format_number(parsed, phonenumbers.PhoneNumberFormat.INTERNATIONAL),
+                "e164": phonenumbers.format_number(parsed, phonenumbers.PhoneNumberFormat.E164),
+                "country": geocoder.description_for_number(parsed, "en"),
+                "carrier": carrier.name_for_number(parsed, "en") or "Unknown",
+                "type": get_number_type(parsed)
+            }
     except:
         pass
-    
-    # Try alternative endpoints
-    alt_urls = [
-        f"https://i.instagram.com/api/v1/users/web_profile_info/?username={username}",
-        f"https://www.instagram.com/{username}/?__a=1&__d=1"
-    ]
-    
-    for url in alt_urls:
-        try:
-            response = requests.get(url, headers=headers, timeout=10)
-            if response.status_code == 200:
-                try:
-                    data = response.json()
-                    if 'graphql' in data:
-                        user_data = data['graphql']['user']
-                        return format_instagram_data(user_data, username)
-                    elif 'user' in data:
-                        return format_instagram_data(data['user'], username)
-                except:
-                    pass
-        except:
-            continue
-    
-    # Search in Leakosint database
-    try:
-        payload = {
-            "token": API_TOKEN,
-            "request": f"instagram {username}",
-            "limit": 50,
-            "lang": LANG
-        }
-        response = requests.post(LEAKOSINT_API_URL, json=payload, timeout=15)
-        if response.status_code == 200:
-            data = response.json()
-            if "List" in data:
-                for db_name, db_content in data["List"].items():
-                    if "instagram" in db_name.lower() or "social" in db_name.lower():
-                        entries = db_content.get("Data", [])
-                        for entry in entries:
-                            if username in str(entry).lower():
-                                return {
-                                    "username": username,
-                                    "found_in_breach": True,
-                                    "breach_data": entry,
-                                    "source": f"Database: {db_name}"
-                                }
-    except:
-        pass
-    
     return None
 
-def format_instagram_data(user_data: dict, username: str) -> dict:
-    """Format Instagram API response."""
-    formatted = {
-        "username": user_data.get('username', username),
-        "full_name": user_data.get('full_name', 'N/A'),
-        "bio": user_data.get('biography', 'N/A')[:200],
-        "followers": user_data.get('edge_followed_by', {}).get('count', 0),
-        "following": user_data.get('edge_follow', {}).get('count', 0),
-        "posts": user_data.get('edge_owner_to_timeline_media', {}).get('count', 0),
-        "is_private": user_data.get('is_private', False),
-        "is_verified": user_data.get('is_verified', False),
-        "profile_pic": user_data.get('profile_pic_url_hd', user_data.get('profile_pic_url', 'N/A')),
-        "external_url": user_data.get('external_url', 'N/A'),
-        "business_category": user_data.get('business_category_name', 'N/A'),
-        "account_type": "Business" if user_data.get('is_business_account') else "Personal",
-        "found_in_breach": False
+def get_number_type(parsed):
+    types = {
+        phonenumbers.PhoneNumberType.MOBILE: "Mobile",
+        phonenumbers.PhoneNumberType.FIXED_LINE: "Landline"
     }
-    return formatted
+    return types.get(phonenumbers.number_type(parsed), "Unknown")
 
-def create_instagram_report(insta_data: dict, username: str) -> str:
-    """Create Instagram report."""
-    if not insta_data:
-        return f"""
-❌ <b>Instagram user '@{username}' not found!</b>
+def create_phone_report(phone_info: Dict) -> str:
+    if not phone_info:
+        return "❌ Invalid phone number"
+    
+    return f"""
+📞 <b>PHONE INFO</b>
+━━━━━━━━━━━━━━━━━━━━━━
 
-💡 <b>Tips:</b>
-• Check spelling of username
-• Account might be deleted/private
-• Try searching with full name instead
+<b>Number:</b> {phone_info['international']}
+<b>Country:</b> {phone_info['country']}
+<b>Carrier:</b> {phone_info['carrier']}
+<b>Type:</b> {phone_info['type']}
 """
-    
-    if insta_data.get('found_in_breach'):
-        return f"""
-🔐 <b>Instagram: @{username}</b>
-⚠️ <b>⚠️ FOUND IN DATA BREACH! ⚠️</b>
 
-📋 <b>Breached Information:</b>
-<pre>{json.dumps(insta_data.get('breach_data', {}), indent=2, ensure_ascii=False)[:1000]}</pre>
-
-<b>Source:</b> {insta_data.get('source', 'Unknown')}
-"""
-    
-    status_emoji = "🔒" if insta_data.get('is_private') else "🌐"
-    verified_badge = " ✓✓✓" if insta_data.get('is_verified') else ""
-    
-    report = f"""
-📸 <b>Instagram Profile{verified_badge}</b> {status_emoji}
-
-<b>👤 Username:</b> @{insta_data['username']}
-<b>📛 Full Name:</b> {insta_data['full_name']}
-<b>📝 Bio:</b> {insta_data['bio']}
-
-<b>📊 Statistics:</b>
-• 👥 Followers: {format_number(insta_data['followers'])}
-• 📌 Following: {format_number(insta_data['following'])}
-• 📷 Posts: {format_number(insta_data['posts'])}
-
-<b>🔧 Account Info:</b>
-• Type: {insta_data['account_type']}
-• Private: {'Yes' if insta_data['is_private'] else 'No'}
-• Verified: {'Yes' if insta_data['is_verified'] else 'No'}
-
-<b>🔗 Links:</b>
-• Profile: https://instagram.com/{insta_data['username']}
-"""
-    
-    if insta_data['external_url'] != 'N/A':
-        report += f"• Website: {insta_data['external_url']}\n"
-    
-    if insta_data['business_category'] != 'N/A':
-        report += f"\n<b>🏢 Category:</b> {insta_data['business_category']}"
-    
-    return report
-
-# ==================== GENERAL SEARCH (Leakosint) ====================
+# ==================== LEAKOSINT SEARCH ====================
 def search_leakosint(query: str, query_id: int) -> Optional[List[str]]:
-    """Search using Leakosint API."""
+    """Search Leakosint database."""
     try:
         payload = {
             "token": API_TOKEN,
@@ -399,7 +452,6 @@ def search_leakosint(query: str, query_id: int) -> Optional[List[str]]:
         api_response = response.json()
         
         if "Error code" in api_response:
-            logger.error(f"API Error: {api_response['Error code']}")
             return None
         
         pages = []
@@ -410,190 +462,159 @@ def search_leakosint(query: str, query_id: int) -> Optional[List[str]]:
             return pages
         
         for db_name, db_content in api_data.items():
-            message_lines = [f"<b>📁 {db_name}</b>", ""]
+            if db_name == "No results found":
+                continue
             
-            info_leak = db_content.get("InfoLeak", "")
-            if info_leak:
-                message_lines.append(info_leak)
-                message_lines.append("")
+            message_lines = [f"<b>📁 {db_name}</b>", "="*30, ""]
             
-            if db_name != "No results found":
-                data_entries = db_content.get("Data", [])
-                for entry in data_entries:
-                    for col_name, col_value in entry.items():
-                        safe_value = str(col_value).replace("<", "&lt;").replace(">", "&gt;")
-                        safe_name = str(col_name).replace("<", "&lt;").replace(">", "&gt;")
-                        message_lines.append(f"<b>{safe_name}</b>: {safe_value}")
-                    message_lines.append("")
-            else:
-                message_lines.append("No data available.")
+            data_entries = db_content.get("Data", [])
+            for entry in data_entries:
+                for col_name, col_value in entry.items():
+                    safe_value = str(col_value).replace("<", "&lt;").replace(">", "&gt;")
+                    safe_name = str(col_name).replace("<", "&lt;").replace(">", "&gt;")
+                    message_lines.append(f"<b>{safe_name}:</b> {safe_value}")
+                message_lines.append("-"*20)
             
             full_message = "\n".join(message_lines).strip()
-            
             if len(full_message) > 3500:
-                full_message = full_message[:3500] + "\n\n⚠️ Truncated..."
+                full_message = full_message[:3500] + "\n\n⚠️ Truncated"
             
             pages.append(full_message)
-        
-        if not pages:
-            pages.append("⚠️ No readable data found.")
         
         report_cache[str(query_id)] = pages
         return pages
         
     except Exception as e:
-        logger.error(f"Leakosint search error: {e}")
+        logger.error(f"Leakosint error: {e}")
         return None
 
 # ==================== HELPERS ====================
 def format_number(num: int) -> str:
-    """Format numbers with K/M suffix."""
     if num >= 1_000_000:
         return f"{num/1_000_000:.1f}M"
     elif num >= 1_000:
         return f"{num/1_000:.1f}K"
     return str(num)
 
-def detect_query_type(query: str) -> Tuple[str, str]:
-    """Detect what type of query this is."""
-    query = query.strip()
+def format_location_text(location: Dict) -> str:
+    if not location:
+        return "📍 Location not available"
     
-    # Check for Facebook UID (numeric, 10-20 digits)
-    if re.match(r'^\d{10,20}$', query):
-        return "facebook_uid", query
+    lines = []
+    if location.get('city'):
+        lines.append(f"• 🏙️ City: {location['city']}")
+    if location.get('state'):
+        lines.append(f"• 🗺️ State: {location['state']}")
+    if location.get('country'):
+        lines.append(f"• 🌍 Country: {location['country']}")
     
-    # Check for Instagram username (alphanumeric with dots/underscores)
-    if re.match(r'^@?[a-zA-Z0-9_.]{1,30}$', query.lstrip('@')):
-        # Exclude if it looks like a phone number or email
-        if not re.match(r'^[\d\s\+\-\(\)]{8,}$', query):
-            return "instagram", query.lstrip('@')
-    
-    # Check for email
-    if re.match(r'^[^@]+@[^@]+\.[^@]+$', query):
-        return "email", query
-    
-    # Check for phone number
-    if re.match(r'^[\d\s\+\-\(\)]{8,}$', query):
-        return "phone", query
-    
-    # Default - general search
-    return "general", query
+    return "\n".join(lines) if lines else "📍 Location not found"
 
-def create_pagination_keyboard(query_id: int, current_page: int, total_pages: int) -> InlineKeyboardMarkup:
-    """Create pagination keyboard."""
-    markup = InlineKeyboardMarkup(row_width=3)
+def format_address_text(address: Dict) -> str:
+    if not address:
+        return "📍 Address not available"
     
-    if total_pages <= 1:
+    lines = []
+    if address.get('street'):
+        lines.append(f"• 🏠 Street: {address['street']}")
+    if address.get('city'):
+        lines.append(f"• 🏙️ City: {address['city']}")
+    if address.get('zip'):
+        lines.append(f"• 📮 ZIP: {address['zip']}")
+    
+    return "\n".join(lines) if lines else "📍 Address not found"
+
+def create_pagination_keyboard(query_id: int, page: int, total: int) -> InlineKeyboardMarkup:
+    markup = InlineKeyboardMarkup(row_width=3)
+    if total <= 1:
         return markup
     
-    if current_page < 0:
-        current_page = total_pages - 1
-    elif current_page >= total_pages:
-        current_page = 0
-    
-    prev_btn = InlineKeyboardButton("◀️ Prev", callback_data=f"page:{query_id}:{current_page - 1}")
-    page_btn = InlineKeyboardButton(f"{current_page + 1}/{total_pages}", callback_data="noop")
-    next_btn = InlineKeyboardButton("Next ▶️", callback_data=f"page:{query_id}:{current_page + 1}")
-    
-    markup.add(prev_btn, page_btn, next_btn)
+    prev = InlineKeyboardButton("◀️ Prev", callback_data=f"page:{query_id}:{page - 1}")
+    ind = InlineKeyboardButton(f"{page + 1}/{total}", callback_data="noop")
+    next = InlineKeyboardButton("Next ▶️", callback_data=f"page:{query_id}:{page + 1}")
+    markup.add(prev, ind, next)
     return markup
 
-def send_safe_message(chat_id: int, text: str, reply_markup=None):
-    """Send message safely."""
+def send_safe(chat_id: int, text: str, reply_markup=None):
     try:
         bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=reply_markup, disable_web_page_preview=True)
     except:
-        clean_text = re.sub(r'<[^>]+>', '', text)
-        bot.send_message(chat_id, clean_text, reply_markup=reply_markup)
+        clean = re.sub(r'<[^>]+>', '', text)
+        bot.send_message(chat_id, clean, reply_markup=reply_markup)
 
-def user_has_access(user_id: int) -> bool:
-    """Check user access."""
-    if not ALLOWED_USER_IDS:
-        return True
-    return user_id in ALLOWED_USER_IDS
-
-# ==================== BOT HANDLERS ====================
+# ==================== BOT COMMANDS ====================
 @bot.message_handler(commands=['start'])
-def send_welcome(message):
-    welcome_text = """
-🔍 <b>Advanced OSINT Bot</b>
+def start(message):
+    welcome = """
+🔍 <b>OSINT BOT v3.0</b>
 
-<b>📱 Features:</b>
-• 🔍 Facebook UID Lookup
-• 📸 Instagram Profile Search  
-• 📧 Email/Phone/Name Search
-• 💾 Data Breach Database
+<b>Commands:</b>
+<code>/fb 61556123456789</code> - Facebook with address
+<code>/ig cristiano</code> - Instagram with location
+<code>/help</code> - Full guide
 
-<b>📝 How to use:</b>
-<code>/fb 1000123456789</code> - Facebook UID lookup
-<code>/ig username</code> - Instagram profile
-<code>@username</code> or any text - General search
-
-<b>⚡ Examples:</b>
-• <code>/fb 61556123456789</code>
-• <code>/ig cristiano</code>
-• <code>+1234567890</code>
-• <code>someone@gmail.com</code>
-
-<b>⚠️ Note:</b> For educational purposes only!
+<b>Auto-detect:</b>
+• +919876543210 → Phone info
+• user@gmail.com → Breach search
+• @username → Instagram
+• 123456789012 → Facebook UID
 """
-    bot.reply_to(message, welcome_text, parse_mode="HTML")
+    bot.reply_to(message, welcome, parse_mode="HTML")
 
 @bot.message_handler(commands=['fb'])
-def handle_facebook(message):
-    """Handle /fb command for Facebook UID lookup."""
-    user_id = message.from_user.id
-    if not user_has_access(user_id):
-        bot.send_message(message.chat.id, "⛔ Access denied.")
-        return
-    
+def fb_cmd(message):
     args = message.text.split(maxsplit=1)
     if len(args) < 2:
-        bot.reply_to(message, "❌ Usage: <code>/fb UID</code>\nExample: <code>/fb 61556123456789</code>", parse_mode="HTML")
+        bot.reply_to(message, "❌ Usage: <code>/fb UID</code>", parse_mode="HTML")
         return
     
     uid = args[1].strip()
     bot.send_chat_action(message.chat.id, "typing")
-    
-    # Send initial message
-    status_msg = bot.send_message(message.chat.id, "🔍 Searching Facebook UID...")
-    
-    fb_data = fetch_facebook_info(uid)
-    report = create_facebook_report(fb_data, uid)
-    
-    bot.edit_message_text(report, chat_id=message.chat.id, message_id=status_msg.message_id, parse_mode="HTML", disable_web_page_preview=True)
+    msg = bot.send_message(message.chat.id, "🔍 Searching Facebook...")
+    data = fetch_facebook_full_info(uid)
+    report = create_facebook_report(data, uid)
+    bot.edit_message_text(report, chat_id=message.chat.id, message_id=msg.message_id, parse_mode="HTML", disable_web_page_preview=True)
 
 @bot.message_handler(commands=['ig'])
-def handle_instagram(message):
-    """Handle /ig command for Instagram lookup."""
-    user_id = message.from_user.id
-    if not user_has_access(user_id):
-        bot.send_message(message.chat.id, "⛔ Access denied.")
-        return
-    
+def ig_cmd(message):
     args = message.text.split(maxsplit=1)
     if len(args) < 2:
-        bot.reply_to(message, "❌ Usage: <code>/ig username</code>\nExample: <code>/ig cristiano</code>", parse_mode="HTML")
+        bot.reply_to(message, "❌ Usage: <code>/ig username</code>", parse_mode="HTML")
         return
     
     username = args[1].strip()
     bot.send_chat_action(message.chat.id, "typing")
-    
-    status_msg = bot.send_message(message.chat.id, "🔍 Searching Instagram...")
-    
-    insta_data = fetch_instagram_info(username)
-    report = create_instagram_report(insta_data, username)
-    
-    bot.edit_message_text(report, chat_id=message.chat.id, message_id=status_msg.message_id, parse_mode="HTML", disable_web_page_preview=True)
+    msg = bot.send_message(message.chat.id, "🔍 Searching Instagram...")
+    data = fetch_instagram_full_info(username)
+    report = create_instagram_report(data, username)
+    bot.edit_message_text(report, chat_id=message.chat.id, message_id=msg.message_id, parse_mode="HTML", disable_web_page_preview=True)
 
-@bot.message_handler(func=lambda message: True)
-def handle_search(message):
-    """Handle all other messages as searches."""
-    user_id = message.from_user.id
-    if not user_has_access(user_id):
-        bot.send_message(message.chat.id, "⛔ Access denied.")
-        return
-    
+@bot.message_handler(commands=['help'])
+def help_cmd(message):
+    help_text = """
+📘 <b>COMMANDS</b>
+
+<b>/fb UID</b> - Facebook with address
+   Example: <code>/fb 61556123456789</code>
+
+<b>/ig username</b> - Instagram with location
+   Example: <code>/ig cristiano</code>
+
+<b>Auto Detection:</b>
+• Phone: <code>+919876543210</code>
+• Email: <code>user@gmail.com</code>
+• Instagram: <code>@username</code>
+• Facebook: <code>61556123456789</code>
+
+<b>What you get:</b>
+• Instagram: City, Country, Maps link
+• Facebook: Location, Address, Maps link
+• Phone: Carrier, Country, Type
+"""
+    bot.reply_to(message, help_text, parse_mode="HTML")
+
+@bot.message_handler(func=lambda m: True)
+def handle_all(message):
     if message.content_type != "text":
         return
     
@@ -601,132 +622,111 @@ def handle_search(message):
     if not query:
         return
     
-    # Detect query type
-    query_type, clean_query = detect_query_type(query)
-    
     bot.send_chat_action(message.chat.id, "typing")
     
-    # Handle Facebook UID
-    if query_type == "facebook_uid":
-        fb_data = fetch_facebook_info(clean_query)
-        report = create_facebook_report(fb_data, clean_query)
-        send_safe_message(message.chat.id, report)
+    # Phone number
+    if re.match(r'^\+?\d{8,15}$', re.sub(r'[^\d+]', '', query)):
+        phone_info = validate_phone_number(query)
+        send_safe(message.chat.id, create_phone_report(phone_info))
+        if phone_info:
+            qid = randint(0, 99999999)
+            pages = search_leakosint(phone_info['e164'], qid)
+            if pages:
+                markup = create_pagination_keyboard(qid, 0, len(pages))
+                send_safe(message.chat.id, pages[0], markup)
         return
     
-    # Handle Instagram
-    if query_type == "instagram":
-        insta_data = fetch_instagram_info(clean_query)
-        report = create_instagram_report(insta_data, clean_query)
-        send_safe_message(message.chat.id, report)
+    # Email
+    if '@' in query and '.' in query:
+        qid = randint(0, 99999999)
+        msg = bot.send_message(message.chat.id, "🔍 Searching email...")
+        pages = search_leakosint(query, qid)
+        if pages:
+            markup = create_pagination_keyboard(qid, 0, len(pages))
+            bot.edit_message_text(pages[0], chat_id=message.chat.id, message_id=msg.message_id, parse_mode="HTML", reply_markup=markup)
+        else:
+            bot.edit_message_text("❌ No results", chat_id=message.chat.id, message_id=msg.message_id)
         return
     
-    # Handle general search via Leakosint
-    query_id = randint(0, 99999999)
-    status_msg = bot.send_message(message.chat.id, f"🔍 Searching for: <code>{query[:50]}</code>...", parse_mode="HTML")
-    
-    pages = search_leakosint(query, query_id)
-    
-    if pages is None:
-        bot.edit_message_text("❌ API error. Please try again.", chat_id=message.chat.id, message_id=status_msg.message_id)
+    # Instagram username
+    if query.startswith('@') or (query.isalnum() and len(query) < 30 and not query.isdigit()):
+        data = fetch_instagram_full_info(query)
+        send_safe(message.chat.id, create_instagram_report(data, query))
         return
     
-    if not pages:
-        bot.edit_message_text("❌ No results found.", chat_id=message.chat.id, message_id=status_msg.message_id)
+    # Facebook UID (digits only)
+    if query.isdigit() and len(query) >= 10:
+        data = fetch_facebook_full_info(query)
+        send_safe(message.chat.id, create_facebook_report(data, query))
         return
     
-    markup = create_pagination_keyboard(query_id, 0, len(pages))
-    bot.edit_message_text(pages[0], chat_id=message.chat.id, message_id=status_msg.message_id, parse_mode="HTML", reply_markup=markup)
+    # General search
+    qid = randint(0, 99999999)
+    msg = bot.send_message(message.chat.id, f"🔍 Searching: {query[:50]}...")
+    pages = search_leakosint(query, qid)
+    if pages:
+        markup = create_pagination_keyboard(qid, 0, len(pages))
+        bot.edit_message_text(pages[0], chat_id=message.chat.id, message_id=msg.message_id, parse_mode="HTML", reply_markup=markup)
+    else:
+        bot.edit_message_text("❌ No results", chat_id=message.chat.id, message_id=msg.message_id)
 
 @bot.callback_query_handler(func=lambda call: True)
-def handle_pagination(call: CallbackQuery):
-    """Handle pagination button clicks."""
+def pagination(call):
     if call.data == "noop":
-        bot.answer_callback_query(call.id, "📄 Page indicator")
+        bot.answer_callback_query(call.id)
         return
     
     if call.data.startswith("page:"):
         try:
-            _, query_id_str, page_str = call.data.split(":")
-            query_id = query_id_str
-            page = int(page_str)
-            
-            pages = report_cache.get(query_id)
+            _, qid, pstr = call.data.split(":")
+            page = int(pstr)
+            pages = report_cache.get(qid)
             if not pages:
-                bot.answer_callback_query(call.id, "❌ Results expired. Search again.")
-                bot.edit_message_reply_markup(chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=None)
+                bot.answer_callback_query(call.id, "❌ Expired")
                 return
             
-            total_pages = len(pages)
+            total = len(pages)
             if page < 0:
-                page = total_pages - 1
-            elif page >= total_pages:
+                page = total - 1
+            elif page >= total:
                 page = 0
             
-            new_markup = create_pagination_keyboard(query_id, page, total_pages)
-            
-            try:
-                bot.edit_message_text(pages[page], chat_id=call.message.chat.id, message_id=call.message.message_id, parse_mode="HTML", reply_markup=new_markup)
-                bot.answer_callback_query(call.id)
-            except:
-                clean_text = re.sub(r'<[^>]+>', '', pages[page])
-                bot.edit_message_text(clean_text, chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=new_markup)
-                bot.answer_callback_query(call.id, "Plain text mode")
-                
+            markup = create_pagination_keyboard(qid, page, total)
+            bot.edit_message_text(pages[page], chat_id=call.message.chat.id, message_id=call.message.message_id, parse_mode="HTML", reply_markup=markup)
+            bot.answer_callback_query(call.id)
         except Exception as e:
             logger.error(f"Pagination error: {e}")
-            bot.answer_callback_query(call.id, "Navigation error")
-
-@bot.message_handler(commands=['help'])
-def send_help(message):
-    help_text = """
-📘 <b>Help Guide</b>
-
-<b>/fb UID</b> - Facebook profile by UID
-<b>/ig username</b> - Instagram profile
-<b>/start</b> - Welcome message
-<b>/help</b> - This guide
-
-<b>📌 Examples:</b>
-• <code>/fb 61556123456789</code>
-• <code>/ig cristiano</code>
-• <code>someone@gmail.com</code>
-• <code>+1234567890</code>
-
-<b>⚠️ Disclaimer:</b>
-For legitimate research only!
-"""
-    bot.reply_to(message, help_text, parse_mode="HTML")
 
 # ==================== MAIN ====================
-def main():
+if __name__ == "__main__":
+    print("\n" + "="*60)
+    print("🤖 OSINT TELEGRAM BOT - WITH PORT BINDING")
+    print("="*60)
+    
     if not BOT_TOKEN:
-        print("\n" + "="*50)
-        print("❌ BOT_TOKEN is not set!")
-        print("="*50)
-        print("\n📝 How to get Bot Token:")
-        print("1. Open Telegram → @BotFather")
-        print("2. Send: /newbot")
-        print("3. Choose a name for your bot")
-        print("4. Choose a username (must end with 'bot')")
-        print("5. Copy the token and paste it in the code")
-        print("\n📍 In code, find: BOT_TOKEN = ''")
-        print("   Replace with: BOT_TOKEN = 'your_token_here'")
-        print("\n✅ API_TOKEN is already set to: 8735045882:dGnfJAPg")
-        print("="*50 + "\n")
-        return
+        print("\n❌ BOT_TOKEN NOT SET!")
+        print("\n📝 Get token from @BotFather on Telegram")
+        print("Set env: export BOT_TOKEN='your_token'")
+        print("="*60)
+        exit(1)
     
-    print("\n" + "="*50)
-    print("🤖 Bot Started Successfully!")
-    print("="*50)
-    print(f"📱 Bot Token: {BOT_TOKEN[:10]}...")
-    print(f"🔑 API Token: {API_TOKEN[:10]}...")
-    print("\n✅ Features:")
-    print("   • Facebook UID Lookup")
-    print("   • Instagram Profile Search")
-    print("   • Email/Phone/Name Search")
-    print("   • Data Breach Database")
-    print("\n" + "="*50 + "\n")
+    print(f"✅ Bot Token: {BOT_TOKEN[:15]}...")
+    print(f"✅ API Token: {API_TOKEN[:15]}...")
+    print(f"✅ Health Port: {PORT}")
+    print("\n📍 Features:")
+    print("   • Instagram: Location + Maps")
+    print("   • Facebook: Address + Maps")
+    print("   • Phone: Carrier + Country")
+    print("   • Email/Name: Breach Search")
+    print("\n" + "="*60)
+    print("🤖 BOT STARTING...")
+    print("="*60 + "\n")
     
+    # Start health check server in background thread
+    health_thread = threading.Thread(target=run_health_server, daemon=True)
+    health_thread.start()
+    
+    # Start bot
     while True:
         try:
             bot.infinity_polling(timeout=60)
@@ -737,6 +737,3 @@ def main():
             logger.error(f"Error: {e}")
             import time
             time.sleep(5)
-
-if __name__ == "__main__":
-    main()

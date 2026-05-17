@@ -1,7 +1,11 @@
 services:
   - type: worker
-    name: leakosint-bot
+    name: osint-bot
     env: python
     buildCommand: pip install -r requirements.txt
-    startCommand: python main.py
-    autoDeploy: true
+    startCommand: python bot.py
+    envVars:
+      - key: BOT_TOKEN
+        value: your_telegram_bot_token_here
+      - key: PORT
+        value: 8080

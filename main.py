@@ -26,7 +26,7 @@ except ImportError:
 # ==================== CONFIGURATION ====================
 # API Key already added here
 API_TOKEN = "8735045882:dGnfJAPg"  # Your Leakosint API token
-BOT_TOKEN = ""  # You need to add your Telegram Bot Token from @BotFather
+BOT_TOKEN = "8683516544:AAGyndEbkMW1wsbXTFIbFMg8AVA_uZ__bSk"  # You need to add your Telegram Bot Token from @BotFather
 LANG = "ru"
 LIMIT = 300
 LEAKOSINT_API_URL = "https://leakosintapi.com/"

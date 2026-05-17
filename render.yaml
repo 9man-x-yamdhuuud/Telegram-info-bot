@@ -6,6 +6,6 @@ services:
     startCommand: python bot.py
     envVars:
       - key: BOT_TOKEN
-        value: your_telegram_bot_token_here
+        value: 8683516544:AAGyndEbkMW1wsbXTFIbFMg8AVA_uZ__bSk
       - key: PORT
         value: 8080
